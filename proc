@@ -1,0 +1,144 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>     // Pour parcourir /proc
+#include <ctype.h>      // Pour isdigit()
+#include <unistd.h>     // Pour sysconf() et sleep()
+#include <pwd.h>        // Pour getpwuid()
+#include <sys/types.h>  // Pour types UID
+#include <time.h>       // Pour gérer le temps
+
+#define BUFFER_SIZE 4096
+
+// Petite fonction pour lire un fichier dans une chaîne
+int read_file(char *path, char *buffer, size_t size) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;  // Si le fichier n'existe pas
+    size_t r = fread(buffer, 1, size - 1, f);
+    buffer[r] = '\0';  // Terminer la chaîne
+    fclose(f);
+    return 1;
+}
+
+// Lire le temps écoulé depuis le démarrage de la machine
+double get_uptime() {
+    char buffer[BUFFER_SIZE];
+    if (!read_file("/proc/uptime", buffer, sizeof(buffer))) return 0;
+    return atof(buffer);
+}
+
+// Convertir des secondes en hh:mm:ss
+void format_time(long seconds, char *out) {
+    int h = seconds / 3600;
+    int m = (seconds % 3600) / 60;
+    int s = seconds % 60;
+    sprintf(out, "%02d:%02d:%02d", h, m, s);
+}
+
+int main() {
+    long ticks = sysconf(_SC_CLK_TCK);    // Nombre de ticks par seconde
+    long page_size = sysconf(_SC_PAGESIZE); // Taille d'une page mémoire
+    long total_mem_kb = 0;
+
+    // Lire la mémoire totale
+    {
+        char buf[BUFFER_SIZE];
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f) {
+            while (fgets(buf, sizeof(buf), f)) {
+                if (sscanf(buf, "MemTotal: %ld kB", &total_mem_kb) == 1) break;
+            }
+            fclose(f);
+        }
+    }
+
+    // Boucle infinie pour mettre à jour l'affichage
+    while (1) {
+        DIR *dir = opendir("/proc");
+        if (!dir) {
+            perror("opendir");
+            return 1;
+        }
+
+        double uptime = get_uptime();
+
+        // Effacer l'écran comme "top"
+        printf("\033[H\033[J");
+
+        // Affichage des entêtes
+        printf("  PID USER        %%CPU %%MEM   TIME+     COMMAND\n");
+        printf("-------------------------------------------------------\n");
+
+        struct dirent *entry;
+
+        // Parcourir tous les dossiers dans /proc
+        while ((entry = readdir(dir)) != NULL) {
+            // Ignorer les fichiers qui ne sont pas des PID
+            if (!isdigit(entry->d_name[0]))
+                continue;
+
+            int pid = atoi(entry->d_name);  // PID actuel
+            char path[BUFFER_SIZE];
+            char buffer[BUFFER_SIZE];
+
+            // Lire /proc/<pid>/stat pour récupérer le nom et le temps CPU
+            sprintf(path, "/proc/%d/stat", pid);
+            if (!read_file(path, buffer, sizeof(buffer)))
+                continue;
+
+            int ppid;
+            long utime, stime, starttime;
+            char comm[256], state;
+
+            // Extraire les champs nécessaires
+            sscanf(buffer,
+                   "%d (%255[^)]) %c %d "
+                   "%*d %*d %*d %*d %*u %*u %*u %*u %*u "
+                   "%ld %ld %*ld %*ld %*ld %*ld %*ld "
+                   "%ld",
+                   &pid, comm, &state, &ppid,
+                   &utime, &stime, &starttime);
+
+            // Calcul du temps CPU total du processus
+            double total_time = (utime + stime) / (double)ticks;
+            double seconds = uptime - (starttime / (double)ticks);
+
+            double cpu_usage = (seconds > 0) ? 100.0 * total_time / seconds : 0;
+
+            // Lire la mémoire utilisée
+            sprintf(path, "/proc/%d/statm", pid);
+            long rss = 0;
+            if (read_file(path, buffer, sizeof(buffer))) {
+                long dummy;
+                sscanf(buffer, "%ld %ld", &dummy, &rss);
+            }
+            double mem_percent = (rss * page_size / 1024.0) * 100.0 / total_mem_kb;
+
+            // Lire l'utilisateur
+            sprintf(path, "/proc/%d/status", pid);
+            int uid = -1;
+            if (read_file(path, buffer, sizeof(buffer))) {
+                char *p = strstr(buffer, "Uid:");
+                if (p) sscanf(p, "Uid:\t%d", &uid);
+            }
+            struct passwd *pw = getpwuid(uid);
+            const char *user = pw ? pw->pw_name : "?";
+
+            // Formater le temps en hh:mm:ss
+            char timestr[32];
+            format_time((long)seconds, timestr);
+
+            // Afficher la ligne du processus
+            printf("%5d %-10s %5.1f %5.1f %10s  %s\n",
+                   pid, user, cpu_usage, mem_percent, timestr, comm);
+        }
+
+        closedir(dir);
+
+        printf("\nMise à jour chaque seconde — Ctrl+C pour quitter\n");
+
+        sleep(1); // Pause 1 seconde avant la prochaine mise à jour
+    }
+
+    return 0;
+}
